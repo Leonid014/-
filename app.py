@@ -4,7 +4,7 @@ import datetime
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-
+from functools import wraps
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///prod.db'
@@ -17,7 +17,7 @@ jwt = JWTManager(app)
 
 
 def generate_password_hash(password):
-    return hashlib.md5(password.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), b'salt', 100000) #Using PBKDF2 for better security
 
 
 class Countries(db.Model):
@@ -61,9 +61,9 @@ def sign_in():
 
     user = User.query.filter_by(login=login).first()
 
-    if user and user.password == generate_password_hash(password):
+    if user and hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), b'salt', 100000) == user.password: #Verify with PBKDF2
         access_token = create_access_token(identity=user.id)
-        return jsonify(token=access_token), 200
+        return jsonify({"token": access_token, "id": user.id}), 200
     else:
         return jsonify({"reason": "Invalid login or password"}), 401
 
@@ -71,7 +71,6 @@ def sign_in():
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
     data = request.json
-    print(data)
 
     required_fields = ['login', 'email', 'password', 'countryCode', 'isPublic']
     for field in required_fields:
@@ -100,7 +99,78 @@ def register_user():
     db.session.add(new_user)
     db.session.commit()
 
-    return jsonify({"message": "User  registered successfully"}), 201
+    return jsonify({"message": "User registered successfully"}), 201
+
+
+def jwt_required_with_user(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            jwt_required()
+            user_id = get_jwt_identity()
+            user = User.query.get(user_id)
+            if user is None:
+                return jsonify({"reason": "User not found"}), 404
+            return fn(user, *args, **kwargs)
+        except Exception as e:
+            return jsonify({"reason": str(e)}), 401
+    return wrapper
+
+
+@app.route('/api/me/profile', methods=['GET', 'PUT'])
+@jwt_required_with_user
+def me_profile(user):
+    if request.method == 'GET':
+        return jsonify({
+            "login": user.login,
+            "email": user.email,
+            "countryCode": user.country_code,
+            "isPublic": user.is_public,
+            "phone": user.phone,
+            "image": user.image
+        })
+    elif request.method == 'PUT':
+        data = request.json
+        user.email = data.get('email', user.email)
+        user.phone = data.get('phone', user.phone)
+        user.image = data.get('image', user.image)
+        db.session.commit()
+        return jsonify({"message": "Profile updated successfully"}), 200
+
+
+@app.route('/api/profiles/<login>', methods=['GET'])
+def get_profile_by_login(login):
+    user = User.query.filter_by(login=login).first()
+    if user is None:
+        return jsonify({"reason": "User not found"}), 404
+    if not user.is_public:
+        return jsonify({"reason": "Profile is private"}), 403
+    return jsonify({
+        "login": user.login,
+        "email": user.email,
+        "countryCode": user.country_code,
+        "isPublic": user.is_public,
+        "phone": user.phone,
+        "image": user.image
+    })
+
+
+@app.route('/api/me/updatePassword', methods=['PUT'])
+@jwt_required_with_user
+def update_password(user):
+    data = request.json
+    old_password = data.get('oldPassword')
+    new_password = data.get('newPassword')
+
+    if not old_password or not new_password:
+        return jsonify({"reason": "Old and new passwords are required"}), 400
+
+    if hashlib.pbkdf2_hmac('sha256', old_password.encode('utf-8'), b'salt', 100000) != user.password:
+        return jsonify({"reason": "Invalid old password"}), 400
+
+    user.password = generate_password_hash(new_password)
+    db.session.commit()
+    return jsonify({"message": "Password updated successfully"}), 200
 
 
 @app.route('/api/countries', methods=['GET'])
@@ -144,4 +214,5 @@ def send():
 
 
 if __name__ == "__main__":
+    db.create_all()
     app.run(debug=True)
